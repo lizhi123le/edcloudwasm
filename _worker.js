@@ -1630,12 +1630,32 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
         }
     }
 };
-const handleWebSocketConn = async (webSocket, request) => {
+// early data 解析必须容错：这里的异常会变成 unhandled rejection（调用处是 fire-and-forget），
+// 客户端只看到 101 之后立刻断开，日志里则是一条 "internal error; reference = ..."。
+// 规则：Referer 取 host 之后的尾段；取不到或不是合法 base64url 都当作「没有 early data」。
+const parseEarlyData = (request) => {
     const refererHeader = request.headers.get("Referer");
     const protocolHeader = refererHeader || request.headers.get("sec-websocket-protocol");
     let earlyDataHeader = null;
-    if (refererHeader) {earlyDataHeader = protocolHeader.slice(request.headers.get("host").length)} else if (protocolHeader) {earlyDataHeader = protocolHeader}
-    const earlyData = earlyDataHeader ? Uint8Array.fromBase64(earlyDataHeader, {alphabet: "base64url"}) : null;
+    if (refererHeader) {
+        // 不能用 host.length 直接切片：真实 Referer 带 https:// 前缀，偏移会落在域名中间。
+        const host = request.headers.get("host") || new URL(request.url).host;
+        const i = host ? refererHeader.indexOf(host) : -1;
+        const tail = (i >= 0 ? refererHeader.slice(i + host.length) : '').replace(/^\/+/, '');
+        // Referer 形式（<host>/<base64url>）是本项目的约定，必须从严：普通 URL 路径里的
+        // 字符也可能被宽松解码成几个字节，混进隧道会直接把会话打断。只认足够长、干净 base64url。
+        if (/^[A-Za-z0-9_-]{16,}={0,2}$/.test(tail)) earlyDataHeader = tail;
+    } else if (protocolHeader) {
+        earlyDataHeader = protocolHeader;
+    }
+    if (!earlyDataHeader) return null;
+    let earlyData;
+    try {earlyData = Uint8Array.fromBase64(earlyDataHeader, {alphabet: "base64url"})} catch {return null}
+    // 空 early data 归一成 null，避免下游的 `earlyData !== null` 判断把它当成真数据。
+    return earlyData.byteLength ? earlyData : null;
+};
+const handleWebSocketConn = async (webSocket, request) => {
+    const earlyData = parseEarlyData(request);
     const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, ssInbound: null, ssOutbound: null, ssResponseSalt: null, xweb: false};
     let processingQueue = null;
     const close = () => {webSocket.close(1011, 'WebSocket is closed')};
@@ -1747,7 +1767,12 @@ export default {
         if (request.headers.get('Upgrade') === 'websocket') {
             const {0: clientSocket, 1: webSocket} = new WebSocketPair();
             webSocket.accept(), webSocket.binaryType = "arraybuffer";
-            handleWebSocketConn(webSocket, request);
+            // fire-and-forget：必须在这里兜住异常，否则会变成 unhandled rejection，
+            // CF 只会记一条 "internal error; reference = ..."，堆栈看不到。
+            handleWebSocketConn(webSocket, request).catch(err => {
+                console.error('ws handler failed:', err?.stack || err);
+                try {webSocket.close(1011, 'internal error')} catch {}
+            });
             return new Response(null, {status: 101, webSocket: clientSocket});
         }
         return new Response(null, {status: 404});

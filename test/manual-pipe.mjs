@@ -30,6 +30,9 @@ const makeBufferedWriter = new Function(`${bufferedWriterSrc}\nreturn createBuff
 const makeQueue = new Function(`${queueSrc}\nreturn createAsyncMicrotaskQueue;`)();
 const makeManualUpload = (handleSession) => new Function('handleSession', `${uploadSrc}\nreturn manualUpload;`)(handleSession);
 
+const earlyDataSrc = slice('const parseEarlyData =', '\nconst handleWebSocketConn');
+const parseEarlyData = new Function(`${earlyDataSrc}\nreturn parseEarlyData;`)();
+
 let failures = 0;
 const check = (name, ok, detail = '') => {
     console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  ' + detail : ''}`);
@@ -376,6 +379,50 @@ function verify(name, chunks, totalBytes) {
     check('needMore 只在 handleSession 内清零（无重复赋值）',
         (source.match(/state\.needMore = false/g) || []).length === 1,
         `occurrences=${(source.match(/state\.needMore = false/g) || []).length}`);
+}
+
+// 17. early-data 解析：畸形头一个都不能抛（抛了就是 WS 连上 101 立刻断 + 后台 internal error）
+{
+    const fakeRequest = (headers, url = 'https://eswasm.qlp.de5.net/proxyip=x') => ({
+        url,
+        headers: {get: k => (k in headers ? headers[k] : null)}
+    });
+    const call = (headers, url) => {
+        try {return {v: parseEarlyData(fakeRequest(headers, url))}}
+        catch (e) {return {e}}
+    };
+    const bytes = a => a && Array.from(a).join(',');
+    // 20 字节的合法 base64url 负载，用于 Referer / protocol 两条路径。
+    const payload = Uint8Array.from({length: 20}, (_, i) => i);
+    const payloadB64 = payload.toBase64({alphabet: 'base64url', omitPadding: true});
+
+    let r = call({Referer: 'https://eswasm.qlp.de5.net/xyz'});
+    check('带 Referer（https://host/path）不抛异常且不混入 early data',
+        !r.e && r.v === null, r.e ? `${r.e.name}: ${r.e.message}` : `v=${bytes(r.v)}`);
+
+    r = call({Referer: `eswasm.qlp.de5.net/${payloadB64}`, host: 'eswasm.qlp.de5.net'});
+    check('Referer 形如 host/base64url 能解析出 early data',
+        !r.e && bytes(r.v) === bytes(payload), r.e ? r.e.message : `bytes=${bytes(r.v)}`);
+
+    r = call({'sec-websocket-protocol': '!!!not-base64!!!'});
+    check('非法 Sec-WebSocket-Protocol 返回 null 且不抛',
+        !r.e && r.v === null, r.e ? `${r.e.name}: ${r.e.message}` : `v=${r.v}`);
+
+    r = call({'sec-websocket-protocol': 'AAECAw'});
+    check('合法 Sec-WebSocket-Protocol 正确解码',
+        !r.e && bytes(r.v) === '0,1,2,3', r.e ? r.e.message : `bytes=${bytes(r.v)}`);
+
+    r = call({Referer: 'https://eswasm.qlp.de5.net/xyz'}, 'https://eswasm.qlp.de5.net/xyz');
+    check('host 头缺失时回退 URL.host，不抛',
+        !r.e, r.e ? `${r.e.name}: ${r.e.message}` : 'ok');
+
+    r = call({Referer: 'https://eswasm.qlp.de5.net', host: 'eswasm.qlp.de5.net'});
+    check('Referer 只有 host 时返回 null（不是空 Uint8Array）',
+        !r.e && r.v === null, r.e ? r.e.message : `v=${r.v}`);
+
+    r = call({});
+    check('无 Referer 且无 protocol 时返回 null',
+        !r.e && r.v === null, r.e ? r.e.message : `v=${r.v}`);
 }
 
 console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
