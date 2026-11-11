@@ -33,6 +33,9 @@ const concurrency = 4;//socket获取并发数
 const enableSniSniff = false;//域名嗅探开关(支持ss vless trojan)
 // ---------------------------------------------------------------------------------
 const urlParamCacheLimit = 20;//URL参数解析结果缓存条数
+/** wasm 协议头解析窗口（parseProtocolWasm 只看前 N 字节），也是握手期可累积的首包上限。
+ *  两处必须一致：累积超过窗口仍解析不出 → 判定非法首包。*/
+const MAX_PROTOCOL_HEAD = 2048;
 // ---------------------------------------------------------------------------------
 //出站socket获取顺序，全局模式下按数组顺序，非全局为：直连>socks>http>https>sstp>turn>turns>nat64>proxyip
 const proxyStrategyOrder = ['socks', 'http', 'https', 'sstp', 'turn', 'turns', 'nat64'];
@@ -1553,7 +1556,7 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
     const allowNeedMore = state.allowNeedMore === true;
     if (allowNeedMore) state.needMore = false;
     let parsedRequest, payload, isSs = false;
-    const ssEnabled = !state.disableSsAead && !!config?.sspass && !state.tcpWriter && state.socks5State === 0, parseLen = Math.min(chunk.length, 2048);
+    const ssEnabled = !state.disableSsAead && !!config?.sspass && !state.tcpWriter && state.socks5State === 0, parseLen = Math.min(chunk.length, MAX_PROTOCOL_HEAD);
     wasmMem.set(chunk.subarray(0, parseLen), dataPtr);
     const success = parseProtocolWasm(parseLen, state.socks5State), r = wasmRes, hLen = r[12];
     if (hLen > 0) {
@@ -1589,7 +1592,11 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
                 }
             } catch {}
         }
-        if (!isSs) return close();
+        if (!isSs) {
+            // 首包既不是 VLESS/Trojan/SS，也不构成 SOCKS5/HTTP 多轮握手：交给调用方显式收口 1008。
+            // xHTTP 路径没有这个回调，仍走原 close()（关闭响应流），行为不变。
+            return state.closeInvalidFirstPacket ? state.closeInvalidFirstPacket('unrecognized protocol header') : close();
+        }
     } else {
         state.socks5State = 0, parsedRequest = {addrType: r[5], port: r[6], dataOffset: r[7], isDns: r[8] === 1, addrBytes: chunk.subarray(r[9], r[9] + r[10]), isHttp: r[11] === 3, isAiDomain: r[36] === 1}, parsedRequest.host = binaryAddrToString(parsedRequest.addrType, parsedRequest.addrBytes), payload = chunk.subarray(parsedRequest.dataOffset);
     }
@@ -1656,12 +1663,45 @@ const parseEarlyData = (request) => {
 };
 const handleWebSocketConn = async (webSocket, request) => {
     const earlyData = parseEarlyData(request);
-    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, ssInbound: null, ssOutbound: null, ssResponseSalt: null, xweb: false};
+    // allowNeedMore：把 wasm 的「协议头还不够」信号（RESULT[14]）回传给调用方，握手期据此跨帧累积首包。
+    // xHTTP 路径一直开着，WS 路径此前漏了 —— 首包被拆成两帧时第一帧解析失败就直接断连。
+    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, ssInbound: null, ssOutbound: null, ssResponseSalt: null, xweb: false, allowNeedMore: true};
     let processingQueue = null;
+    const log = (info) => console.log(`[ws] ${info}`);
     const close = () => {webSocket.close(1011, 'WebSocket is closed')};
-    const process = (chunk) => {
-        if (state.tcpWriter) return state.tcpWriter(chunk);
-        return handleSession(earlyData ? chunk : new Uint8Array(chunk), state, request, webSocket, close, earlyData !== null);
+    // 首包非法（既不是 VLESS/Trojan/SS，也不构成 SOCKS5/HTTP 多轮握手）时显式 1008：
+    // 客户端能拿到确定的关闭码，日志也能和「管道异常（1011）」区分开。
+    // reason 只写服务端日志，不回给未认证调用方（避免变成 UUID / 口令 oracle）。
+    let firstPacketClosed = false;   // 已按非法首包收口：后续排队帧不再解析、不再重复关闭与打日志
+    const closeInvalidFirstPacket = (reason) => {
+        if (firstPacketClosed) return;
+        firstPacketClosed = true;
+        log(`invalid first packet: ${reason}`);
+        try {webSocket.close(1008, 'Invalid protocol or authentication failed')} catch {}
+    };
+    state.closeInvalidFirstPacket = closeInvalidFirstPacket;
+
+    // 握手期首包累积：上限用 wasm 的解析窗口，超出仍解析不出即按非法首包收口。
+    let preamble = null;
+    const process = async (chunk) => {
+        if (firstPacketClosed) return;
+        const incoming = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+        // 零长度帧不消耗首包判定机会：客户端/中间设备可能发空 WS 帧（心跳、分片实现），继续等真首包。
+        if (!incoming.byteLength) return;
+        if (state.tcpWriter) return state.tcpWriter(incoming);
+        // 首包可能被拆成多个 WS 帧（或 early data 只带一截）：拼起来再交给 wasm 解析。
+        let buffer = incoming;
+        if (preamble) {
+            buffer = new Uint8Array(preamble.byteLength + incoming.byteLength);
+            buffer.set(preamble), buffer.set(incoming, preamble.byteLength);
+        }
+        preamble = buffer;
+        await handleSession(buffer, state, request, webSocket, close, earlyData !== null);
+        if (state.needMore) {
+            if (preamble.byteLength >= MAX_PROTOCOL_HEAD) closeInvalidFirstPacket(`protocol header exceeds ${MAX_PROTOCOL_HEAD} bytes`);
+            return;
+        }
+        preamble = null;
     };
     processingQueue = createAsyncMicrotaskQueue(process, close);
     if (earlyData) processingQueue(earlyData);
