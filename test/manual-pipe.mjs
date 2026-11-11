@@ -365,5 +365,18 @@ function verify(name, chunks, totalBytes) {
     check('队列关闭只触发一次 close', closeCalls === 1, `closeCalls=${closeCalls}`);
 }
 
+// 16. 静态检查：清理后不应残留已删除的状态位/脚手架，且新状态位已声明
+{
+    const removed = ['xwebPipeTo', 'enableChunkStats', 'recordChunkStat', 'chunkStatsHistogram', 'upBridge', 'rawTcpWriter'];
+    const leaked = removed.filter(name => source.includes(name));
+    check('_worker.js 无已删除标识符残留', leaked.length === 0, `leaked=${leaked.join(',')}`);
+
+    check('xweb 状态字面量含 closed / downstreamPiped',
+        /xweb: true, closed: false, downstreamPiped: false/.test(source));
+    check('needMore 只在 handleSession 内清零（无重复赋值）',
+        (source.match(/state\.needMore = false/g) || []).length === 1,
+        `occurrences=${(source.match(/state\.needMore = false/g) || []).length}`);
+}
+
 console.log(failures ? `\n${failures} 项失败` : '\n全部通过');
 process.exit(failures ? 1 : 0);

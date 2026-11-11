@@ -1604,7 +1604,7 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
         if (!tcpResult) return close();
         state.tcpSocket = tcpResult.socket, state.tcpSpeed = tcpResult.speed;
         const tcpWriter = state.tcpSocket.writable.getWriter();
-        const bufferedTcpWriter = state.xwebPipeTo ? (chunk) => tcpWriter.write(chunk) : createBufferedTcpWriter(tcpWriter, close);
+        const bufferedTcpWriter = state.xweb ? (chunk) => tcpWriter.write(chunk) : createBufferedTcpWriter(tcpWriter, close);
         if (payload.byteLength) await tcpWriter.write(payload);
         if (isSs || state.ssOutbound) {
             state.tcpWriter = async (c) => {
@@ -1625,7 +1625,7 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
         } else {
             if (state.tcpSocket.extra?.length) await writable.send(state.tcpSocket.extra);
             state.tcpWriter = bufferedTcpWriter;
-            if (state.xwebPipeTo) return;
+            if (state.xweb) return;
             manualPipe(state.tcpSocket.readable, writable, close, tcpResult.speed);
         }
     }
@@ -1636,7 +1636,7 @@ const handleWebSocketConn = async (webSocket, request) => {
     let earlyDataHeader = null;
     if (refererHeader) {earlyDataHeader = protocolHeader.slice(request.headers.get("host").length)} else if (protocolHeader) {earlyDataHeader = protocolHeader}
     const earlyData = earlyDataHeader ? Uint8Array.fromBase64(earlyDataHeader, {alphabet: "base64url"}) : null;
-    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, ssInbound: null, ssOutbound: null, ssResponseSalt: null};
+    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, ssInbound: null, ssOutbound: null, ssResponseSalt: null, xweb: false};
     let processingQueue = null;
     const close = () => {webSocket.close(1011, 'WebSocket is closed')};
     const process = (chunk) => {
@@ -1703,8 +1703,7 @@ const manualUpload = async (reader, state, request, writable, close, startDownst
             used += chunkLen;
             if (!state.tcpWriter) {
                 // 握手阶段：把已攒的全部字节交给 handleSession，它可能只消费前一段，剩下的继续攒。
-                // needMore 可能由 handleSession 置位，读取方清零后继续攒够再交。
-                state.needMore = false;
+                // needMore 由 handleSession 自己维护（进入时清零、字节不够时置位）。
                 await handleSession(bufferView.subarray(0, used), state, request, writable, close);
                 state.needMore || (used = 0);
                 state.tcpWriter && startDownstream();
@@ -1717,14 +1716,19 @@ const manualUpload = async (reader, state, request, writable, close, startDownst
 const handleXwebPost = async (request) => {
     const reader = request.body?.getReader({mode: 'byob'});
     if (!reader) return new Response(null, {status: 400});
-    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, needMore: false, allowNeedMore: true, disableSsAead: true, xwebPipeTo: true, tcpSpeed: 0};
+    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, needMore: false, allowNeedMore: true, disableSsAead: true, xweb: true, closed: false, downstreamPiped: false, tcpSpeed: 0};
     const bridge = new IdentityTransformStream({highWaterMark: 1024 * 1024}), responseWriter = bridge.writable.getWriter();
-    const close = () => {if (state.xwebPipeTo) state.xwebPipeTo = false, reader.cancel().catch(() => {}), responseWriter.close().catch(() => {})};
+    const close = () => {
+        if (state.closed) return;
+        state.closed = true;
+        reader.cancel().catch(() => {});
+        responseWriter.close().catch(() => {});
+    };
     const writable = {send(chunk) {if (chunk?.byteLength) return responseWriter.write(chunk)}};
     // 下行：manualPipe 直接写 responseWriter，send 返回 write() 的 Promise，背压经 read() → TCP 接收窗口传导。
     // 这里不 releaseLock，否则下行结束时无法正常关闭响应。
     const startDownstream = () => {
-        if (!state.tcpSocket || !state.xwebPipeTo || state.downstreamPiped) return;
+        if (!state.tcpSocket || state.closed || state.downstreamPiped) return;
         state.downstreamPiped = true;
         manualPipe(state.tcpSocket.readable, {send: chunk => responseWriter.write(chunk)}, close, state.tcpSpeed)
             .then(() => {
