@@ -1395,6 +1395,8 @@ const establishTcpConnection = async (parsedRequest, request) => {
     }
     return null;
 };
+// 与 maxChunkLen 无关：判据是“本次读到的长度”，不是视图上限。
+const smallChunkThreshold = 4096;
 const manualPipe = async (readable, writable, close, speed) => {
     const n = parseFloat(speed), speedLimit = n > 0;
     let pipeBufferSize = bufferSize, pipeFlushTime = flushTime, pipeStartThreshold = startThreshold;
@@ -1409,32 +1411,61 @@ const manualPipe = async (readable, writable, close, speed) => {
     }
     const safeBufferSize = pipeBufferSize - maxChunkLen;
     let bufferView = new Uint8Array(pipeBufferSize), spareBuffer = new ArrayBuffer(maxChunkLen);
-    let offset = 0, totalBytes = 0, time = 0, timerId = null, resume = null, done, value;
+    let offset = 0, totalBytes = 0, time = 0, timerId = null, resume = null, flushing = null, done, value;
+    // 发送未落地前不能复用 bufferView，所以 flush 返回 Promise，读循环会等它完成。
     const flushBuffer = () => {
-        if (offset > 0) (writable.send(bufferView.subarray(0, offset)), offset = 0);
-        timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
+        timerId && (clearTimeout(timerId), timerId = null);
+        let pending = null;
+        if (offset > 0) {
+            const len = offset;
+            offset = 0;
+            try {pending = writable.send(bufferView.subarray(0, len))} catch {close?.()}
+        }
+        if (pending && typeof pending.then === 'function') {
+            const p = flushing = Promise.resolve(pending).then(() => {}, () => {});
+            p.then(() => {
+                if (flushing !== p) return;
+                flushing = null, resume?.(), resume = null;
+            });
+            return p;
+        }
+        flushing || (resume?.(), resume = null);
+        return flushing;
     };
-    const reader = readable.getReader({mode: 'byob'});
+    // 字节流 sink（IdentityTransformStream / TCP socket）在 send/write 时可能直接 transfer 走 ArrayBuffer，
+    // 之后 bufferView 就处于 detached 状态，必须换一块新缓冲区，不能继续复用。
+    const ensureBufferView = () => bufferView.buffer.byteLength || (bufferView = new Uint8Array(pipeBufferSize));
     try {
+        const reader = readable.getReader({mode: 'byob'});
         while (true) {
+            if (flushing) await flushing;
+            ensureBufferView();
             if (offset > 0) {
                 ({done, value} = await reader.read(new Uint8Array(spareBuffer, 0, maxChunkLen)));
+                if (done) break;
+                // 等待读期间定时器可能已经发出一批，此时 offset 已归零，等它落地再写。
+                if (flushing) await flushing;
+                ensureBufferView(); // 同一次等待里缓冲区也可能被 transfer 走
                 bufferView.set(value, offset), spareBuffer = value.buffer;
             } else {
                 ({done, value} = await reader.read(new Uint8Array(bufferView.buffer, offset, maxChunkLen)));
+                if (done) break;
                 bufferView = new Uint8Array(value.buffer);
             }
-            if (done) break;
             const chunkLen = value.byteLength;
             offset += chunkLen, totalBytes += chunkLen;
-            if (chunkLen < 4096) {
+            if (chunkLen < smallChunkThreshold) {
                 if (!speedLimit) totalBytes = 0;
                 time = 2;
             } else if (totalBytes > pipeStartThreshold) time = pipeFlushTime;
             timerId ||= setTimeout(flushBuffer, time);
-            offset > safeBufferSize && (totalBytes > pipeStartThreshold ? await new Promise(r => resume = r) : flushBuffer());
+            if (offset > safeBufferSize) {
+                if (totalBytes > pipeStartThreshold) await new Promise(r => resume = r);
+                else await flushBuffer();
+            }
         }
-    } catch {offset = 0, close?.()} finally {flushBuffer()}
+    } catch {offset = 0, close?.()}
+    finally {await flushBuffer()}
 };
 const createBufferedTcpWriter = (tcpWriter, close) => {
     const buffer = new Uint8Array(32768);
@@ -1443,44 +1474,79 @@ const createBufferedTcpWriter = (tcpWriter, close) => {
         if (closed) return;
         closed = true, timerId && (clearTimeout(timerId), timerId = null), close?.();
     };
+    // 返回 write() 的 Promise，让源站写入队列的背压传回上传方向。
     const flush = () => {
         timerId && (clearTimeout(timerId), timerId = null);
         if (!offset || closed) return;
         const len = offset;
         offset = 0;
-        try {tcpWriter.write(buffer.subarray(0, len))} catch {closeWriter()}
+        try {
+            const pending = tcpWriter.write(buffer.subarray(0, len));
+            return pending && typeof pending.then === 'function' ? Promise.resolve(pending).catch(() => {closeWriter()}) : pending;
+        } catch {closeWriter()}
     };
-    return chunk => {
+    return async chunk => {
         if (closed) return;
         const data = chunk.constructor === Uint8Array ? chunk : new Uint8Array(chunk), len = data.byteLength;
         if (!len) return;
-        offset + len > 32768 && flush(), buffer.set(data, offset), offset += len, offset === 32768 ? flush() : (timerId ||= setTimeout(flush, 1));
+        if (len >= 32768) {
+            // 先同步把已缓冲数据交出去（write 在流内部按序排队），再直写大块，避免等待期间乱序。
+            flush();
+            if (closed) return;
+            try {
+                const direct = tcpWriter.write(data);
+                direct && typeof direct.then === 'function' && await Promise.resolve(direct).catch(() => {closeWriter()});
+            } catch {closeWriter()}
+            return;
+        }
+        if (offset + len > 32768) {
+            const pending = flush();
+            pending && await pending;
+            if (closed) return;
+        }
+        buffer.set(data, offset), offset += len;
+        if (offset === 32768) {
+            const pending = flush();
+            pending && await pending;
+        } else timerId ||= setTimeout(flush, 1);
     };
 };
-const createAsyncMicrotaskQueue = (consume, close) => {
-    const queue = new Array(256).fill(null);
-    let head = 0, tail = 0, size = 0, drainActive = false, closed = false;
+const createAsyncMicrotaskQueue = (consume, close, maxSize = 256, lowWater = maxSize - 1) => {
+    const queue = new Array(maxSize).fill(null);
+    let head = 0, tail = 0, size = 0, drainActive = false, closed = false, waiters = null;
+    const notifyWaiters = () => {
+        if (!waiters || size > lowWater) return;
+        const list = waiters;
+        waiters = null;
+        for (let i = 0; i < list.length; i++) list[i]();
+    };
     const closeQueue = () => {
         if (closed) return;
         closed = true;
-        for (let i = 0; i < 256; i++) queue[i] = null;
-        close?.();
+        for (let i = 0; i < maxSize; i++) queue[i] = null;
+        // 必须把水位归零：否则 size > lowWater 时 notifyWaiters 直接返回，
+        // 已经 await 在背压 Promise 上的生产方会永远挂起。
+        size = 0, head = tail = 0;
+        notifyWaiters(), close?.();
     };
     const drainQueue = async () => {
         if (closed) return;
         try {
             while (size > 0 && !closed) {
                 const chunk = queue[head];
-                queue[head] = null, head = (head + 1) & 255, size--;
+                queue[head] = null, head = (head + 1) % maxSize, size--;
                 await consume(chunk);
+                notifyWaiters();
             }
         } catch {closeQueue()} finally {drainActive = false}
     };
     return chunk => {
         if (closed) return;
-        if (size === 256) return closeQueue();
-        queue[tail] = chunk, tail = (tail + 1) & 255, size++;
+        if (size === maxSize) return closeQueue();
+        queue[tail] = chunk, tail = (tail + 1) % maxSize, size++;
         if (!drainActive) drainActive = true, queueMicrotask(drainQueue);
+        // 超过低水位时返回 Promise，调用方 await 即可把背压一路传回数据源。
+        if (size > lowWater) return new Promise(resolve => (waiters ||= []).push(resolve));
     };
 };
 const handleSession = async (chunk, state, request, writable, close, isEarlyData = false) => {
@@ -1492,7 +1558,7 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
     const success = parseProtocolWasm(parseLen, state.socks5State), r = wasmRes, hLen = r[12];
     if (hLen > 0) {
         const handshake = wasmMem.slice(dataPtr, dataPtr + hLen);
-        writable.send(handshake);
+        await writable.send(handshake);
     }
     if (allowNeedMore && r[14] === 1) return state.needMore = true;
     if (!success) {
@@ -1536,23 +1602,23 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
     } else {
         const tcpResult = await establishTcpConnection(parsedRequest, request);
         if (!tcpResult) return close();
-        state.tcpSocket = tcpResult.socket;
+        state.tcpSocket = tcpResult.socket, state.tcpSpeed = tcpResult.speed;
         const tcpWriter = state.tcpSocket.writable.getWriter();
-        state.rawTcpWriter = tcpWriter;
         const bufferedTcpWriter = state.xwebPipeTo ? (chunk) => tcpWriter.write(chunk) : createBufferedTcpWriter(tcpWriter, close);
-        if (payload.byteLength) tcpWriter.write(payload);
+        if (payload.byteLength) await tcpWriter.write(payload);
         if (isSs || state.ssOutbound) {
             state.tcpWriter = async (c) => {
                 await ssAeadDecryptFeed(state.ssInbound, c instanceof Uint8Array ? c : new Uint8Array(c), async plain => {
-                    if (plain.byteLength) bufferedTcpWriter(plain);
+                    if (plain.byteLength) await bufferedTcpWriter(plain);
                 });
             };
             state.ssResponseSalt?.length && writable.send(state.ssResponseSalt), state.ssResponseSalt = null;
             (async () => {
+                // 队列上限 4、低水位 1：manualPipe 等待 send 落地，内存从 ~63MB 收敛到 ~1MB。
                 const ssSendQueue = createAsyncMicrotaskQueue(async (chunk) => {
                     const encrypted = await ssAeadEncryptChunks(state.ssOutbound, chunk);
-                    encrypted.byteLength && writable.send(encrypted);
-                }, close);
+                    encrypted.byteLength && await writable.send(encrypted);
+                }, close, 4, 1);
                 state.tcpSocket.extra?.length && ssSendQueue(state.tcpSocket.extra);
                 await manualPipe(state.tcpSocket.readable, {send: chunk => ssSendQueue(chunk.slice())}, close, tcpResult.speed);
             })().catch(close);
@@ -1579,57 +1645,94 @@ const handleWebSocketConn = async (webSocket, request) => {
     };
     processingQueue = createAsyncMicrotaskQueue(process, close);
     if (earlyData) processingQueue(earlyData);
-    webSocket.addEventListener("message", event => (state.tcpWriter || processingQueue)(event.data));
+    webSocket.addEventListener("message", event => {
+        const pending = (state.tcpWriter || processingQueue)(event.data);
+        pending && typeof pending.then === 'function' && pending.catch(close);
+    });
     webSocket.addEventListener("error", close);
 };
 const xwebHeaders = {'Content-Type': 'application/octet-stream', 'grpc-status': '0', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store'};
+// 上行与 manualPipe 同构的自研实现：BYOB 读进预分配缓冲 → 攒批 → 一次 write → await 落地后再读。
+// 取代原先「读满 8000 次后把 request.body 交回内建管道」的半截手写循环：那条链路一半手写、
+// 一半走内建管道，阈值还是按「读次数」而不是字节数计的。
+const uploadReadSize = 32768;
+const uploadBufferSize = uploadReadSize * 2;
+const uploadFlushThreshold = uploadReadSize;
+const uploadFlushTime = 1;
+const manualUpload = async (reader, state, request, writable, close, startDownstream) => {
+    let bufferView = new Uint8Array(uploadBufferSize), spareBuffer = new ArrayBuffer(uploadReadSize);
+    let used = 0, timerId = null, flushing = null, done, value;
+    // 字节流 sink 可能 transfer 走 ArrayBuffer（detach），之后必须换一块新缓冲区。
+    const ensureBufferView = () => bufferView.buffer.byteLength || (bufferView = new Uint8Array(uploadBufferSize));
+    // 攒批写出；返回 write() 的 Promise，让源站写入队列的背压传回 reader.read()。
+    const flush = () => {
+        timerId && (clearTimeout(timerId), timerId = null);
+        if (used <= 0 || !state.tcpWriter) return flushing;
+        const len = used;
+        used = 0;
+        let pending;
+        try {pending = state.tcpWriter(bufferView.subarray(0, len))} catch {close(); return}
+        if (pending && typeof pending.then === 'function') {
+            const p = flushing = Promise.resolve(pending).then(() => {}, () => {close()});
+            p.then(() => {if (flushing === p) flushing = null});
+            return p;
+        }
+    };
+    try {
+        while (true) {
+            if (flushing) await flushing;
+            ensureBufferView();
+            if (used > 0) {
+                // 已有未送出的数据：先读进独立缓冲，避免写落地期间复用正在发送的那一块。
+                ({done, value} = await reader.read(new Uint8Array(spareBuffer, 0, uploadReadSize)));
+                if (done) break;
+                if (flushing) await flushing;
+                ensureBufferView(); // 读期间定时器可能已经发出并 detach 了缓冲区
+                if (used + value.byteLength > bufferView.byteLength) {
+                    const grown = new Uint8Array(used + value.byteLength);
+                    grown.set(bufferView.subarray(0, used)), bufferView = grown;
+                }
+                bufferView.set(value, used), spareBuffer = value.buffer;
+            } else {
+                ({done, value} = await reader.read(new Uint8Array(bufferView.buffer, 0, uploadReadSize)));
+                if (done) break;
+                bufferView = new Uint8Array(value.buffer);
+            }
+            const chunkLen = value.byteLength;
+            if (!chunkLen) continue;
+            used += chunkLen;
+            if (!state.tcpWriter) {
+                // 握手阶段：把已攒的全部字节交给 handleSession，它可能只消费前一段，剩下的继续攒。
+                // needMore 可能由 handleSession 置位，读取方清零后继续攒够再交。
+                state.needMore = false;
+                await handleSession(bufferView.subarray(0, used), state, request, writable, close);
+                state.needMore || (used = 0);
+                state.tcpWriter && startDownstream();
+            } else if (used > uploadFlushThreshold) await flush();
+            else timerId ||= setTimeout(flush, uploadFlushTime);
+        }
+    } catch {used = 0, close()}
+    finally {await flush()}
+};
 const handleXwebPost = async (request) => {
     const reader = request.body?.getReader({mode: 'byob'});
     if (!reader) return new Response(null, {status: 400});
-    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, needMore: false, allowNeedMore: true, disableSsAead: true, xwebPipeTo: true};
-    const bridge = new IdentityTransformStream({highWaterMark: 1024 * 1024}), upBridge = new IdentityTransformStream({highWaterMark: 1024 * 1024 * 1024}), responseWriter = bridge.writable.getWriter();
+    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, needMore: false, allowNeedMore: true, disableSsAead: true, xwebPipeTo: true, tcpSpeed: 0};
+    const bridge = new IdentityTransformStream({highWaterMark: 1024 * 1024}), responseWriter = bridge.writable.getWriter();
     const close = () => {if (state.xwebPipeTo) state.xwebPipeTo = false, reader.cancel().catch(() => {}), responseWriter.close().catch(() => {})};
     const writable = {send(chunk) {if (chunk?.byteLength) return responseWriter.write(chunk)}};
-    (async () => {
-        let bufferView = new Uint8Array(32768), spareBuffer = new ArrayBuffer(8192), used = 0, uploaded = 0, timerId = null, done, value;
-        const flush = () => {
-            if (used > 0 && state.tcpWriter && bufferView) (state.tcpWriter(bufferView.subarray(0, used)), used = 0);
-            timerId && (clearTimeout(timerId), timerId = null);
-        };
-        try {
-            while (true) {
-                if (used > 0 && state.tcpWriter) {
-                    ({done, value} = await reader.read(new Uint8Array(spareBuffer, 0, 8192)));
-                    bufferView.set(value, used), spareBuffer = value.buffer;
-                } else {
-                    ({done, value} = await reader.read(new Uint8Array(bufferView.buffer, used, 8192)));
-                    bufferView = new Uint8Array(value.buffer);
-                }
-                if (done) break;
-                const chunkLen = value.byteLength;
-                if (!chunkLen) continue;
-                used += chunkLen;
-                if (state.tcpWriter) {
-                    if (++uploaded >= 8000) {
-                        flush();
-                        await state.rawTcpWriter.ready;
-                        reader.releaseLock(), state.rawTcpWriter.releaseLock(), state.xwebPipeTo = false, bufferView = null, spareBuffer = null;
-                        request.body.pipeThrough(upBridge).pipeTo(state.tcpSocket.writable);
-                        break;
-                    }
-                    used > 24576 ? flush() : (timerId ||= setTimeout(flush, 1));
-                } else {
-                    state.needMore = false;
-                    await handleSession(bufferView.subarray(0, used), state, request, writable, close);
-                    if (state.tcpSocket && state.xwebPipeTo && !state.downstreamPiped) {
-                        state.downstreamPiped = true, responseWriter.releaseLock();
-                        state.tcpSocket.readable.pipeTo(bridge.writable);
-                    }
-                    if (!state.needMore) used = 0;
-                }
-            }
-        } catch {used = 0, close()} finally {flush()}
-    })().catch(close);
+    // 下行：manualPipe 直接写 responseWriter，send 返回 write() 的 Promise，背压经 read() → TCP 接收窗口传导。
+    // 这里不 releaseLock，否则下行结束时无法正常关闭响应。
+    const startDownstream = () => {
+        if (!state.tcpSocket || !state.xwebPipeTo || state.downstreamPiped) return;
+        state.downstreamPiped = true;
+        manualPipe(state.tcpSocket.readable, {send: chunk => responseWriter.write(chunk)}, close, state.tcpSpeed)
+            .then(() => {
+                // 正常结束只关闭响应，不取消上传半（保持原有链路收尾行为）。
+                responseWriter.close().catch(() => {});
+            }, close);
+    };
+    manualUpload(reader, state, request, writable, close, startDownstream).catch(close);
     return new Response(bridge.readable, {headers: xwebHeaders});
 };
 export default {
