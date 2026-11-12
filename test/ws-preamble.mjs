@@ -24,15 +24,15 @@ const slice = (startMark, endMark) => {
 const queueSrc = slice('const createAsyncMicrotaskQueue =', '\nconst handleSession');
 // parseEarlyData + handleWebSocketConn 在源码里是连续的两段，一次切完
 const wsConnSrc = slice('const parseEarlyData =', '\nconst xwebHeaders');
-// handshake 累积上限是模块级常量，必须一起切进来（否则被测代码里是未定义标识符）
-const maxHeadSrc = slice('const MAX_PROTOCOL_HEAD =', '\n');
+// handshake 累积上限 + 诊断日志都是模块级常量，必须一起切进来（否则被测代码里是未定义标识符）
+const preludeSrc = slice('const MAX_PROTOCOL_HEAD =', '\n// ---');
 
 const makeQueue = new Function(`${queueSrc}\nreturn createAsyncMicrotaskQueue;`)();
 
 /** 用真实 handleWebSocketConn 源码构造处理器，注入 handleSession 桩 */
 const makeWsConn = (handleSessionStub) => new Function(
     'handleSession', 'createAsyncMicrotaskQueue',
-    `${maxHeadSrc}\n${wsConnSrc}\nreturn handleWebSocketConn;`
+    `${preludeSrc}\n${wsConnSrc}\nreturn handleWebSocketConn;`
 )(handleSessionStub, makeQueue);
 
 let failures = 0;
@@ -218,6 +218,36 @@ const toArrayBuffer = (bytes) => bytes.buffer.slice(bytes.byteOffset, bytes.byte
     check('会话建立后帧直通 tcpWriter', sameBytes(concatBytes(...written), Uint8Array.from([4, 5, 6])),
         `written=${written.map((w) => w.byteLength).join(',')}`);
     check('会话建立后不再调用 handleSession', sessionCalls === 1, `sessionCalls=${sessionCalls}`);
+}
+
+// 7) error 态的 socket 上 close() 会抛：必须内部吞掉，否则就是新的 unhandled rejection
+{
+    const rejections = [];
+    const onRej = (err) => rejections.push(err);
+    process.on('unhandledRejection', onRej);
+    const originalLog = console.log;
+    console.log = () => {};
+    try {
+        const listeners = {};
+        let closeAttempts = 0;
+        const conn = makeWsConn(async (_chunk, state) => { state.closeInvalidFirstPacket('bad header'); });
+        const ws = {
+            addEventListener(type, fn) { (listeners[type] ||= []).push(fn); },
+            close() {
+                closeAttempts++;
+                throw new Error("Can't call WebSocket close() after error");
+            }
+        };
+        await conn(ws, makeRequest());
+        for (const fn of listeners.message || []) fn({data: toArrayBuffer(Uint8Array.from([1, 2, 3]))});
+        await tick(30);
+        check('error 态 close 抛错不影响排队帧处理', listeners.message?.length === 1);
+        check('error 态 close 抛错只尝试一次（幂等）', closeAttempts === 1, `attempts=${closeAttempts}`);
+        check('error 态 close 抛错不产生未处理拒绝', rejections.length === 0, `rejections=${rejections.length}`);
+    } finally {
+        console.log = originalLog;
+        process.off('unhandledRejection', onRej);
+    }
 }
 
 console.log(failures ? `\n${failures} 项失败` : '\n全部通过');

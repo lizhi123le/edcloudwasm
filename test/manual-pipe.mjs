@@ -26,9 +26,10 @@ const makeManualPipe = (maxChunkLen) => new Function(
 )(256 * 1024, maxChunkLen, 3, 50 * 1024 * 1024, 4096);
 
 const uploadSrc = slice('const uploadReadSize', '\nconst handleXwebPost');
+const preludeSrc = slice('const MAX_PROTOCOL_HEAD =', '\n// ---'); // manualUpload 依赖 MAX_PROTOCOL_HEAD 与 logOnce
 const makeBufferedWriter = new Function(`${bufferedWriterSrc}\nreturn createBufferedTcpWriter;`)();
 const makeQueue = new Function(`${queueSrc}\nreturn createAsyncMicrotaskQueue;`)();
-const makeManualUpload = (handleSession) => new Function('handleSession', `${uploadSrc}\nreturn manualUpload;`)(handleSession);
+const makeManualUpload = (handleSession) => new Function('handleSession', `${preludeSrc}\n${uploadSrc}\nreturn manualUpload;`)(handleSession);
 
 const earlyDataSrc = slice('const parseEarlyData =', '\nconst handleWebSocketConn');
 const parseEarlyData = new Function(`${earlyDataSrc}\nreturn parseEarlyData;`)();
@@ -423,6 +424,61 @@ function verify(name, chunks, totalBytes) {
     r = call({});
     check('无 Referer 且无 protocol 时返回 null',
         !r.e && r.v === null, r.e ? r.e.message : `v=${r.v}`);
+}
+
+// 18. 后台 internal error 的三类来源：未接住的拒绝 / 无界累积 / 静默吞错
+{
+    // 18a. 队列消费方抛错：不能变成 unhandled rejection，close 只一次，错误只记一次
+    const rejections = [];
+    const onRej = (err) => rejections.push(err);
+    process.on('unhandledRejection', onRej);
+    const originalError = console.error;
+    const logged = [];
+    console.error = (...args) => logged.push(args.join(' '));
+    let closeCalls = 0;
+    try {
+        const queue = makeQueue(async () => {throw new Error('boom');}, () => {closeCalls++;}, 8, 7);
+        queue(new Uint8Array([1]));
+        queue(new Uint8Array([2]));
+        await new Promise(r => setTimeout(r, 60));
+    } finally {
+        console.error = originalError;
+        process.off('unhandledRejection', onRej);
+    }
+    check('队列消费方抛错不产生未处理拒绝', rejections.length === 0, `rejections=${rejections.length}`);
+    check('队列消费方抛错只 close 一次', closeCalls === 1, `closeCalls=${closeCalls}`);
+    check('队列消费方抛错只记一条日志',
+        logged.filter(l => l.includes('consumer failed')).length === 1, `logs=${logged.length}`);
+}
+
+{
+    // 18b. xHTTP 握手期一直 needMore：到解析窗口就收口，不能把 used 攒到内存上限
+    const originalError = console.error;
+    console.error = () => {};
+    let closes = 0, calls = 0, maxSeen = 0;
+    try {
+        const manualUpload = makeManualUpload(async (chunk, s) => {
+            calls++, maxSeen = Math.max(maxSeen, chunk.byteLength);
+            s.needMore = true; // wasm 永远说「协议头还不够」
+        });
+        await manualUpload(makeSource(64 * 1024, 1024).getReader({mode: 'byob'}), {tcpWriter: null, xweb: true},
+            {}, {send: async () => {}}, () => {closes++;}, () => {});
+    } finally {
+        console.error = originalError;
+    }
+    check('xHTTP 首包超窗即收口（不再无界累积）', closes === 1 && calls === 2, `closes=${closes} calls=${calls}`);
+    check('xHTTP 首包累积不超过解析窗口', maxSeen <= 2048, `maxSeen=${maxSeen}`);
+}
+
+{
+    // 18c. 静默吞错/越界写入的静态守卫
+    check('UUID 空值时 match 结果有兜底', source.includes('match(/../g) || []'));
+    check('URL 长度按字节数判定（不是 UTF-16 字符数）',
+        /urlBytes\.length > MAX_PROTOCOL_HEAD/.test(source) && !/clean\.length > 2048/.test(source));
+    check('decodeURIComponent 已包 try（safeDecode）',
+        source.includes('const safeDecode =') && !/decodeURIComponent\(v\)\.split/.test(source));
+    check('SS 首字节 1/3/4 不抢占 needMore（ssCandidate）',
+        source.includes('const ssCandidate = ssEnabled'));
 }
 
 console.log(failures ? `\n${failures} 项失败` : '\n全部通过');

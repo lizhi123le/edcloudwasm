@@ -36,6 +36,13 @@ const urlParamCacheLimit = 20;//URL参数解析结果缓存条数
 /** wasm 协议头解析窗口（parseProtocolWasm 只看前 N 字节），也是握手期可累积的首包上限。
  *  两处必须一致：累积超过窗口仍解析不出 → 判定非法首包。*/
 const MAX_PROTOCOL_HEAD = 2048;
+/** 诊断日志：CF 对未处理异常只留一条 "internal error; reference = ..."，真实原因必须自己打。
+ * 每条连接只记一次：客户端批量断开时不会把 tail 刷满。*/
+const logOnce = (state, info) => {
+    if (state.loggedError) return;
+    state.loggedError = true;
+    console.error(`[${state.xweb ? 'xhttp' : 'ws'}] ${info}`);
+};
 // ---------------------------------------------------------------------------------
 //出站socket获取顺序，全局模式下按数组顺序，非全局为：直连>socks>http>https>sstp>turn>turns>nat64>proxyip
 const proxyStrategyOrder = ['socks', 'http', 'https', 'sstp', 'turn', 'turns', 'nat64'];
@@ -85,7 +92,9 @@ const getEnv = (env) => {
 const initializeWasm = (env) => {
     wasmRes[13] = enableSniSniff ? 1 : 0;
     const {uuid, password, user, pass} = getEnv(env);
-    const cleanUuid = uuid.replaceAll('-', '').match(/../g);
+    // 空 / 过短的 UUID 会让 match 返回 null，直接取 .length 就是 TypeError；
+    // 那会让 isInitialized 永远置不上位，此后每个请求都抛一次（整段 1101）。
+    const cleanUuid = uuid.replaceAll('-', '').match(/../g) || [];
     if (cleanUuid.length === 32) {
         wasmRes[0] = 1;
         const uuidBytes = new Uint8Array(16);
@@ -1297,6 +1306,11 @@ const concurrentStrategyExec = (parsedRequest, params, exec, limit, txt) => {
     const attempts = params.map(param => Promise.resolve().then(() => exec(parsedRequest, param, limit, txt)));
     return raceAny(attempts);
 };
+// URL 参数来自用户路径，畸形百分号编码（如 "%zz"）会让 decodeURIComponent 抛 URIError；
+// 这类请求不该被一条 URIError 打成整个事件失败。
+const safeDecode = (v) => {
+    try {return decodeURIComponent(v)} catch {return v}
+};
 const getUrlParam = (offset, len) => {
     if (len <= 0) return null;
     const sub = wasmMem.subarray(dataPtr + offset, dataPtr + offset + len);
@@ -1323,11 +1337,14 @@ const establishTcpConnection = async (parsedRequest, request) => {
         }
     } else {
         let normalList = [], aiList = null;
-        if (clean.length < 6 || clean.length > 2048) {
+        // 判据必须是「写进 wasm 的字节数」：clean.length 是 UTF-16 字符数，中文/编码路径
+        // 1 字符最多 4 字节。按字符放行会越过 2048 字节的 COMMON_BUF，把后面的
+        // SOCKS5 认证包 / UUID / HTTP AUTH 静默覆盖成脏数据（之后整机鉴权全乱）。
+        const urlBytes = clean.length >= 6 ? textEncoder.encode(clean) : null;
+        if (!urlBytes || urlBytes.length > MAX_PROTOCOL_HEAD) {
             normalList.push({type: 0}, {type: 3}, {type: 3, param: proxyHost});
             aiList = [{type: 3, param: aiProxyip}, {type: 3}, {type: 3, param: proxyHost}];
         } else {
-            const urlBytes = textEncoder.encode(clean);
             wasmMem.set(urlBytes, dataPtr);
             parseUrlWasm(urlBytes.length);
             const r = wasmRes;
@@ -1347,7 +1364,7 @@ const establishTcpConnection = async (parsedRequest, request) => {
             const proxyItems = [];
             const add = (targetList, v, t, txt) => {
                 if (!v) return;
-                const parts = decodeURIComponent(v).split(',').filter(Boolean);
+                const parts = safeDecode(v).split(',').filter(Boolean);
                 if (txt) {
                     for (let i = 0; i < parts.length; i++) targetList.push({type: t, param: parts[i], txt});
                 } else if (parts.length) {
@@ -1530,8 +1547,13 @@ const createAsyncMicrotaskQueue = (consume, close, maxSize = 256, lowWater = max
         // 必须把水位归零：否则 size > lowWater 时 notifyWaiters 直接返回，
         // 已经 await 在背压 Promise 上的生产方会永远挂起。
         size = 0, head = tail = 0;
-        notifyWaiters(), close?.();
+        notifyWaiters();
+        // close 回调可能是「关闭 WebSocket」：workerd 里已进入 error 态的 socket，
+        // close() 会把内部错误原样抛出。这里必须吞掉 —— 否则就是在 catch 块里再抛一次，
+        // 变成谁也接不住的 unhandled rejection。
+        try {close?.()} catch {}
     };
+    let drainErrorLogged = false;
     const drainQueue = async () => {
         if (closed) return;
         try {
@@ -1541,13 +1563,20 @@ const createAsyncMicrotaskQueue = (consume, close, maxSize = 256, lowWater = max
                 await consume(chunk);
                 notifyWaiters();
             }
-        } catch {closeQueue()} finally {drainActive = false}
+        } catch (err) {
+            if (!drainErrorLogged) {
+                drainErrorLogged = true;
+                console.error('[queue] consumer failed:', err?.stack || err);
+            }
+            closeQueue();
+        } finally {drainActive = false}
     };
     return chunk => {
         if (closed) return;
         if (size === maxSize) return closeQueue();
         queue[tail] = chunk, tail = (tail + 1) % maxSize, size++;
-        if (!drainActive) drainActive = true, queueMicrotask(drainQueue);
+        // drainQueue 是 float promise：onRejected 必须挂上，不然消费方抛错就只剩一条 reference。
+        if (!drainActive) drainActive = true, queueMicrotask(() => {drainQueue().catch(() => {})});
         // 超过低水位时返回 Promise，调用方 await 即可把背压一路传回数据源。
         if (size > lowWater) return new Promise(resolve => (waiters ||= []).push(resolve));
     };
@@ -1563,7 +1592,11 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
         const handshake = wasmMem.slice(dataPtr, dataPtr + hLen);
         await writable.send(handshake);
     }
-    if (allowNeedMore && r[14] === 1) return state.needMore = true;
+    // wasm 的「协议头还不够」（RESULT[14]）。SS 有一个例外：密文首字节随机，约 1.2% 会
+    // 恰好是 1/3/4，被 wasm 当成「SS 明文地址类型」而报头不够；这时只要 salt+最小帧
+    // （34 字节）已到齐，就该交给下面的 SS 解密分支，不能一直攒到窗口上限再断连。
+    const ssCandidate = ssEnabled && chunk.length >= 34 && (chunk[0] === 1 || chunk[0] === 3 || chunk[0] === 4);
+    if (allowNeedMore && r[14] === 1 && !ssCandidate) return state.needMore = true;
     if (!success) {
         if (r[4] > 0) return state.socks5State = r[4];
         if (ssEnabled && chunk.length >= 34) {
@@ -1628,12 +1661,20 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
                 }, close, 4, 1);
                 state.tcpSocket.extra?.length && ssSendQueue(state.tcpSocket.extra);
                 await manualPipe(state.tcpSocket.readable, {send: chunk => ssSendQueue(chunk.slice())}, close, tcpResult.speed);
-            })().catch(close);
+            })().catch(err => {
+                logOnce(state, `ss downstream failed: ${err?.stack || err}`);
+                close();
+            });
         } else {
             if (state.tcpSocket.extra?.length) await writable.send(state.tcpSocket.extra);
             state.tcpWriter = bufferedTcpWriter;
             if (state.xweb) return;
-            manualPipe(state.tcpSocket.readable, writable, close, tcpResult.speed);
+            // 下行泵是 fire-and-forget：必须自带 onRejected。原来裸调用，任何一处抛错
+            // （关闭后再 send、流被 cancel…）都只剩一条 "internal error; reference = ..."。
+            manualPipe(state.tcpSocket.readable, writable, close, tcpResult.speed).catch(err => {
+                logOnce(state, `downstream pipe failed: ${err?.stack || err}`);
+                close();
+            });
         }
     }
 };
@@ -1668,7 +1709,15 @@ const handleWebSocketConn = async (webSocket, request) => {
     const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, ssInbound: null, ssOutbound: null, ssResponseSalt: null, xweb: false, allowNeedMore: true};
     let processingQueue = null;
     const log = (info) => console.log(`[ws] ${info}`);
-    const close = () => {webSocket.close(1011, 'WebSocket is closed')};
+    // close 必须幂等且不抛：workerd 里已进入 error 态的 WebSocket，close() 会把内部
+    // 错误原样抛出；而它被到处当成 rejection handler 用，一抛就是新的 unhandled rejection。
+    let wsClosed = false;
+    const closeSocket = (code, reason) => {
+        if (wsClosed) return;
+        wsClosed = true;
+        try {webSocket.close(code, reason)} catch {}
+    };
+    const close = () => closeSocket(1011, 'WebSocket is closed');
     // 首包非法（既不是 VLESS/Trojan/SS，也不构成 SOCKS5/HTTP 多轮握手）时显式 1008：
     // 客户端能拿到确定的关闭码，日志也能和「管道异常（1011）」区分开。
     // reason 只写服务端日志，不回给未认证调用方（避免变成 UUID / 口令 oracle）。
@@ -1677,7 +1726,7 @@ const handleWebSocketConn = async (webSocket, request) => {
         if (firstPacketClosed) return;
         firstPacketClosed = true;
         log(`invalid first packet: ${reason}`);
-        try {webSocket.close(1008, 'Invalid protocol or authentication failed')} catch {}
+        closeSocket(1008, 'Invalid protocol or authentication failed');
     };
     state.closeInvalidFirstPacket = closeInvalidFirstPacket;
 
@@ -1707,7 +1756,11 @@ const handleWebSocketConn = async (webSocket, request) => {
     if (earlyData) processingQueue(earlyData);
     webSocket.addEventListener("message", event => {
         const pending = (state.tcpWriter || processingQueue)(event.data);
-        pending && typeof pending.then === 'function' && pending.catch(close);
+        // 每帧入口是 fire-and-forget：这里漏掉 onRejected 就是一条 reference 日志。
+        pending && typeof pending.then === 'function' && pending.catch(err => {
+            logOnce(state, `frame processing failed: ${err?.stack || err}`);
+            close();
+        });
     });
     webSocket.addEventListener("error", close);
 };
@@ -1765,13 +1818,23 @@ const manualUpload = async (reader, state, request, writable, close, startDownst
                 // 握手阶段：把已攒的全部字节交给 handleSession，它可能只消费前一段，剩下的继续攒。
                 // needMore 由 handleSession 自己维护（进入时清零、字节不够时置位）。
                 await handleSession(bufferView.subarray(0, used), state, request, writable, close);
+                if (state.needMore && used >= MAX_PROTOCOL_HEAD) {
+                    // 与 WS 路径同一判据：超过 wasm 解析窗口还凑不出合法头 → 判非法收口。
+                    // 不设上限时 used 只增不减，垃圾首包能一路把 bufferView 顶到内存上限。
+                    logOnce(state, `protocol header exceeds ${MAX_PROTOCOL_HEAD} bytes`);
+                    used = 0, close();
+                    return;
+                }
                 state.needMore || (used = 0);
                 state.tcpWriter && startDownstream();
             } else if (used > uploadFlushThreshold) await flush();
             else timerId ||= setTimeout(flush, uploadFlushTime);
         }
-    } catch {used = 0, close()}
-    finally {await flush()}
+    } catch (err) {
+        used = 0;
+        logOnce(state, `upload failed: ${err?.stack || err}`);
+        close();
+    } finally {await flush()}
 };
 const handleXwebPost = async (request) => {
     const reader = request.body?.getReader({mode: 'byob'});
@@ -1796,7 +1859,10 @@ const handleXwebPost = async (request) => {
                 responseWriter.close().catch(() => {});
             }, close);
     };
-    manualUpload(reader, state, request, writable, close, startDownstream).catch(close);
+    manualUpload(reader, state, request, writable, close, startDownstream).catch(err => {
+        logOnce(state, `upload pump failed: ${err?.stack || err}`);
+        close();
+    });
     return new Response(bridge.readable, {headers: xwebHeaders});
 };
 export default {
